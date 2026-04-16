@@ -1,4 +1,4 @@
-const HTTP_METHODS = ["get", "post", "put", "patch", "delete"] as const;
+const HTTP_METHODS = ["get", "post", "put", "patch", "delete", "head", "options"] as const;
 
 interface RawParam {
   name?: string;
@@ -78,11 +78,17 @@ export function processGitHubSpec(raw: Record<string, unknown>): Record<string, 
       const op = pathItem[method];
       if (!op) continue;
 
-      // Merge path-level + operation-level parameters, simplify each
-      const allParams = [...pathParams, ...(op.parameters || [])];
-      const params = allParams
-        .map((p) => simplifyParam(p, raw))
-        .filter((p): p is NonNullable<typeof p> => p !== null);
+      // Merge path-level + operation-level parameters with operation-level override
+      const paramMap = new Map<
+        string,
+        { name: string; in: string; required?: boolean; type?: string; description?: string }
+      >();
+      for (const p of [...pathParams, ...(op.parameters || [])]) {
+        const simplified = simplifyParam(p, raw);
+        if (!simplified) continue;
+        paramMap.set(`${simplified.in}:${simplified.name}`, simplified);
+      }
+      const params = [...paramMap.values()];
 
       // Simplify request body to just description + required
       let requestBody: { description?: string; required?: boolean; contentType?: string } | undefined;

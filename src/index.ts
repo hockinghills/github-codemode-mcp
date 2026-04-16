@@ -129,13 +129,20 @@ async () => {
 
       const rateLimitRemaining = res.headers.get("x-ratelimit-remaining");
       const rateLimitReset = res.headers.get("x-ratelimit-reset");
-      const data = await res.json().catch(() => null);
+      const contentType = res.headers.get("content-type") || "";
+      const data = contentType.includes("application/json")
+        ? await res.json().catch(() => null)
+        : await res.text();
 
       if (!res.ok) {
         return {
           error: true,
           status: res.status,
-          message: (data as Record<string, unknown>)?.message ?? res.statusText,
+          message:
+            (typeof data === "object" && data !== null
+              ? (data as Record<string, unknown>)?.message
+              : undefined) ??
+            (typeof data === "string" && data.length > 0 ? data : res.statusText),
           rateLimit: {
             remaining: rateLimitRemaining,
             resetsAt: rateLimitReset
