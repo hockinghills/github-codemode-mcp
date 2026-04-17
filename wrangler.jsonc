@@ -1,0 +1,16 @@
+{
+  "name": "github-codemode-mcp",
+  "compatibility_date": "2026-04-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/index.ts",
+  "observability": {
+    "logs": { "enabled": true }
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "8893cd7fdcd84638b11f7c9c9c39baf5"
+    }
+  ]
+}
