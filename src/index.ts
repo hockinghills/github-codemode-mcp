@@ -8,6 +8,8 @@ import { getGitHubUser } from "./auth/github-auth";
 import { processGitHubSpec } from "./spec-processor";
 import type { AuthProps } from "./auth/types";
 
+const GIT_CREDENTIAL_TTL = 3600; // 1 hour sliding window
+
 const GITHUB_SPEC_URL =
   "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json";
 
@@ -40,7 +42,8 @@ async function createMcpResponse(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
-  token: string
+  token: string,
+  kv?: KVNamespace
 ): Promise<Response> {
   const spec = await getSpec();
   const executor = new DynamicWorkerExecutor({ loader: env.LOADER });
@@ -156,6 +159,70 @@ async () => {
     },
   });
 
+  // Add setup_git_auth tool if KV is available
+  if (kv) {
+    server.tool(
+      "setup_git_auth",
+      "Configure git credentials for this session. Call once per session — git push/pull/clone will work for 1 hour of activity (sliding window, resets on each use). No parameters needed.",
+      {},
+      async () => {
+        const user = await getGitHubUser(token);
+        const key = crypto.randomUUID();
+        const workerUrl = new URL(request.url).origin;
+
+        // Fetch email if not on profile
+        let email = user.email;
+        if (!email) {
+          const emailRes = await fetch("https://api.github.com/user/emails", {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: "application/vnd.github+json",
+              "User-Agent": "github-codemode-mcp/1.0.0",
+            },
+          });
+          if (emailRes.ok) {
+            const emails = (await emailRes.json()) as Array<{
+              email: string;
+              primary: boolean;
+            }>;
+            email = emails.find((e) => e.primary)?.email || emails[0]?.email;
+          }
+        }
+
+        await kv.put(
+          `git:cred:${key}`,
+          JSON.stringify({ token, login: user.login, email: email || `${user.login}@users.noreply.github.com` }),
+          { expirationTtl: GIT_CREDENTIAL_TTL }
+        );
+
+        const script = [
+          "#!/bin/bash",
+          `# Git credential helper — token never appears in this script`,
+          `cat > /tmp/git-cred-helper.sh << 'HELPER'`,
+          `#!/bin/bash`,
+          `if [ "$1" = "get" ]; then`,
+          `  curl -sf "${workerUrl}/credential/${key}"`,
+          `fi`,
+          `HELPER`,
+          `chmod +x /tmp/git-cred-helper.sh`,
+          `git config --global credential.helper '/tmp/git-cred-helper.sh'`,
+          `git config --global user.name "${user.login}"`,
+          `git config --global user.email "${email || `${user.login}@users.noreply.github.com`}"`,
+          `echo "git auth configured for ${user.login}"`,
+        ].join("\n");
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Run this script to configure git credentials:\n\n\`\`\`bash\n${script}\n\`\`\`\n\nCredentials are valid for 1 hour of inactivity (each git operation resets the timer). If git auth expires, call setup_git_auth again.`,
+            },
+          ],
+        };
+      }
+    );
+  }
+
   return createMcpHandler(server)(request, env, ctx);
 }
 
@@ -174,20 +241,63 @@ function createMcpApiHandler() {
         headers: { "Content-Type": "application/json" },
       });
     }
-    return createMcpResponse(c.req.raw, c.env as Env, ctx, props.accessToken);
+    return createMcpResponse(c.req.raw, c.env as Env, ctx, props.accessToken, (c.env as Env).OAUTH_KV);
   });
 
   return app;
 }
 
+/**
+ * Handle git credential requests — returns credentials and resets TTL
+ */
+async function handleCredentialRequest(key: string, kv: KVNamespace): Promise<Response> {
+  const stored = await kv.get(`git:cred:${key}`);
+  if (!stored) {
+    return new Response("not found", { status: 404 });
+  }
+
+  const { token, login, email } = JSON.parse(stored) as {
+    token: string;
+    login: string;
+    email: string;
+  };
+
+  // Reset TTL — sliding window
+  await kv.put(`git:cred:${key}`, stored, { expirationTtl: GIT_CREDENTIAL_TTL });
+
+  // Git credential protocol format
+  const body = [
+    "protocol=https",
+    "host=github.com",
+    `username=${login}`,
+    `password=${token}`,
+    "",
+  ].join("\n");
+
+  return new Response(body, {
+    headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" },
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Credential endpoint — no auth required, key is the secret
+    if (url.pathname.startsWith("/credential/")) {
+      const key = url.pathname.slice("/credential/".length);
+      if (!key) {
+        return new Response("missing key", { status: 400 });
+      }
+      return handleCredentialRequest(key, env.OAUTH_KV);
+    }
+
     // Direct PAT mode — for CLI usage without OAuth
     if (isDirectToken(request)) {
       const token = request.headers.get("Authorization")!.slice(7);
       try {
         await getGitHubUser(token); // validate token
-        return createMcpResponse(request, env, ctx, token);
+        return createMcpResponse(request, env, ctx, token, env.OAUTH_KV);
       } catch {
         return new Response(JSON.stringify({ error: "Invalid GitHub token" }), {
           status: 401,
